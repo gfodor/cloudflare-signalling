@@ -94,6 +94,11 @@ type InboundMsg =
   | ConnectedMsg
   | GenericInboundMsg;
 
+type TeardownOptions = {
+  closePeer?: boolean;
+  notifyPeer?: boolean;
+};
+
 type Participant = {
   socket: WebSocket;
   request: Request;
@@ -409,7 +414,14 @@ export class RoomDurableObject {
         case "connected": {
           // In standalone, close immediately; otherwise ignore.
           if (participant?.standalone) {
-            protocolErrorClose("connected (standalone close)");
+            const current = participant;
+            try {
+              current.socket.close(1000, "connected");
+            } catch {
+              /* ignore */
+            }
+            this.teardown(current, "standalone-connected", { closePeer: false, notifyPeer: false });
+            participant = null;
           }
           break;
         }
@@ -486,44 +498,61 @@ export class RoomDurableObject {
     }
   }
 
-  private teardown(p: Participant | null, reason: string) {
-    // Remove timers & determine slots
-    if (p) {
-      if (p.pingInterval) clearInterval(p.pingInterval as any);
-      if (p.pongDeadline) clearTimeout(p.pongDeadline as any);
-      if (p.readDeadline) clearInterval(p.readDeadline as any);
-    }
-
-    // Figure out which slot closed
-    let closingWasA = false;
-    if (p && this.a && p.connectionId === this.a.connectionId) {
-      closingWasA = true;
-    }
+  private teardown(p: Participant | null, reason: string, opts?: TeardownOptions) {
+    if (!p) return;
 
     const self = p;
-    const peer = self ? (closingWasA ? this.b : this.a) : null;
+    const peer = this.getPeer(self);
+    const closePeer = opts?.closePeer !== false;
+    const notifyPeer = opts?.notifyPeer ?? closePeer;
 
-    // Notify peer ('bye') only in normal mode (i.e., not standalone on either?)
-    // Spec: send bye to surviving peer (normal mode). If either participant is standalone, skip bye.
-    const shouldSendBye = !!peer && !(self?.standalone || peer?.standalone);
+    const participantsToClose: Participant[] = [];
+    const seen = new Set<string>();
+
+    const addParticipant = (participant: Participant | null) => {
+      if (!participant) return;
+      if (seen.has(participant.connectionId)) return;
+      seen.add(participant.connectionId);
+      participantsToClose.push(participant);
+    };
+
+    addParticipant(self);
+    if (closePeer) addParticipant(peer);
+
+    const shouldSendBye =
+      notifyPeer &&
+      !!peer &&
+      closePeer &&
+      !(self.standalone || peer.standalone);
 
     if (shouldSendBye && peer) {
       try {
         peer.socket.send(jsonStringify({ type: "bye" }));
-      } catch { /* ignore */ }
+      } catch {
+        /* ignore */
+      }
     }
 
-    // Close both sockets
-    if (self) {
-      try { self.socket.close(1000, "closing"); } catch { /* ignore */ }
-    }
-    if (peer) {
-      try { peer.socket.close(1000, "peer closing"); } catch { /* ignore */ }
+    for (const target of participantsToClose) {
+      if (target.pingInterval) clearInterval(target.pingInterval as any);
+      if (target.pongDeadline) clearTimeout(target.pongDeadline as any);
+      if (target.readDeadline) clearInterval(target.readDeadline as any);
     }
 
-    // Post disconnect webhook(s) for each participant (if configured)
-    const postDisc = (pp: Participant | null) => {
-      if (!pp || !this.cfg.disconnectWebhookUrl) return;
+    const selfCloseReason = reason === "standalone-connected" ? "connected" : "closing";
+    const peerCloseReason = "peer closing";
+
+    for (const target of participantsToClose) {
+      const closeMessage = target.connectionId === self.connectionId ? selfCloseReason : peerCloseReason;
+      try {
+        target.socket.close(1000, closeMessage);
+      } catch {
+        /* ignore */
+      }
+    }
+
+    const postDisc = (pp: Participant) => {
+      if (!this.cfg.disconnectWebhookUrl) return;
       const payload = {
         roomId: pp.routedRoomId,
         clientId: pp.clientId,
@@ -534,7 +563,6 @@ export class RoomDurableObject {
         const value = pp.request.headers.get(name);
         if (value) headers.set(name, value);
       }
-      // Fire-and-forget with timeout; failures do not affect teardown
       (async () => {
         try {
           const ctl = AbortSignal.timeout(5000);
@@ -544,18 +572,20 @@ export class RoomDurableObject {
             body: JSON.stringify(payload),
             signal: ctl,
           });
-        } catch { /* ignore */ }
+        } catch {
+          /* ignore */
+        }
       })();
     };
-    postDisc(self);
-    postDisc(peer);
 
-    // Clear room state
-    if (self && this.a && self.connectionId === this.a.connectionId) this.a = null;
-    if (self && this.b && self.connectionId === this.b.connectionId) this.b = null;
-    // If both were closed due to peer logic, ensure both slots clear
-    if (peer && this.a && peer.connectionId === this.a.connectionId) this.a = null;
-    if (peer && this.b && peer.connectionId === this.b.connectionId) this.b = null;
+    for (const target of participantsToClose) {
+      postDisc(target);
+    }
+
+    for (const target of participantsToClose) {
+      if (this.a && target.connectionId === this.a.connectionId) this.a = null;
+      if (this.b && target.connectionId === this.b.connectionId) this.b = null;
+    }
   }
 
   private getPeer(p: Participant): Participant | null {

@@ -161,13 +161,9 @@ Clients that set `"standalone": true` in the registration message receive specia
 
 ## Known Gaps / Spec Divergences
 
-Current gaps relative to the Ayame-DO spec:
-- Standalone clients trigger `teardown`, which closes both sockets, whenever they send `{ "type": "connected" }` (`src/index.ts:347-352` and `src/index.ts:444-459`). Confirm whether the spec intends to close only the standalone side or both participants in that mode.
-
-Addressing this item will bring the worker fully in line with the provided specification.
+No known deviations from the Ayame-DO spec at this time. If you spot something unexpected, please file an issue so we can track it.
 
 ## Next Steps
-- Decide how standalone mode should behave when `{ "type": "connected" }` arrives (close only the standalone peer vs. both participants) and update teardown accordingly.
 - Add automated protocol tests (for example using Miniflare) to cover registration success/denial, heartbeat, webhook, and standalone flows.
 - Document operational logging/observability once implemented.
 
