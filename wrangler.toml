@@ -4,9 +4,16 @@ compatibility_date = "2025-10-22"
 
 [durable_objects]
 bindings = [
-  { name = "SIGNALLING_ROOM", class_name = "SignallingRoom" }
+  # New binding matching the spec
+  { name = "ROOMS_DO", class_name = "RoomDurableObject" }
+  # If you still have legacy environments, you may keep the old binding uncommented there.
+  # { name = "SIGNALLING_ROOM", class_name = "SignallingRoom" }
 ]
 
 [[migrations]]
 tag = "v1"
 new_classes = ["SignallingRoom"]
+
+[[migrations]]
+tag = "v2"
+new_classes = ["RoomDurableObject"]
