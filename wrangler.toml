@@ -1,0 +1,12 @@
+name = "cloudflare-signalling"
+main = "src/index.ts"
+compatibility_date = "2025-10-22"
+
+[durable_objects]
+bindings = [
+  { name = "SIGNALLING_ROOM", class_name = "SignallingRoom" }
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["SignallingRoom"]
