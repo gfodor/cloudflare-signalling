@@ -1,6 +1,14 @@
 export interface Env {
-  SIGNALLING_ROOM: DurableObjectNamespace;
-  ROOMS_DO: DurableObjectNamespace;
+  SIGNALLING_ROOM?: DurableObjectNamespace;
+  ROOMS_DO?: DurableObjectNamespace;
+  AUTHN_WEBHOOK_URL?: string;
+  DISCONNECT_WEBHOOK_URL?: string;
+  COPY_WEBSOCKET_HEADER_NAMES?: string;
+  TYPE_MESSAGE?: string;
+  WS_PING_INTERVAL_SEC?: string;
+  WS_PONG_TIMEOUT_SEC?: string;
+  WS_READ_TIMEOUT_SEC?: string;
+  READ_LIMIT_BYTES?: string;
 }
 
 export default {
@@ -45,11 +53,46 @@ export default {
       { status: 200 }
     );
   },
-}
+};
 
 // -----------------------------
 // Room Durable Object implementation
 // -----------------------------
+
+type JsonPrimitive = null | boolean | number | string;
+type Json = JsonPrimitive | Json[] | { [key: string]: Json };
+type JsonObject = { [key: string]: Json | undefined };
+
+type RegisterMsg = {
+  type: "register";
+  roomId: string;
+  clientId?: string;
+  signalingKey?: string;
+  key?: string;
+  authnMetadata?: Json;
+  ayameClient?: string;
+  libwebrtc?: string;
+  environment?: string;
+  standalone?: boolean;
+};
+
+type OfferMsg = { type: "offer" } & Record<string, Json>;
+type AnswerMsg = { type: "answer" } & Record<string, Json>;
+type CandidateMsg = { type: "candidate" } & Record<string, Json>;
+type MessageMsg = { type: "message" } & Record<string, Json>;
+type PongMsg = { type: "pong" } & Record<string, Json>;
+type ConnectedMsg = { type: "connected" } & Record<string, Json>;
+type GenericInboundMsg = { type: string; [key: string]: Json };
+
+type InboundMsg =
+  | RegisterMsg
+  | OfferMsg
+  | AnswerMsg
+  | CandidateMsg
+  | MessageMsg
+  | PongMsg
+  | ConnectedMsg
+  | GenericInboundMsg;
 
 type Participant = {
   socket: WebSocket;
@@ -103,6 +146,7 @@ export class RoomDurableObject {
     this.state = state;
     this.env = env;
     this.cfg = parseConfig(env);
+  }
 
   async fetch(request: Request): Promise<Response> {
     const upgradeHeader = request.headers.get("Upgrade");
@@ -127,6 +171,7 @@ export class RoomDurableObject {
     });
 
     return new Response(null, { status: 101, webSocket: client });
+  }
 
   private attach(ws: WebSocket, request: Request, keys: { routedRoomId: string; urlRoomId?: string; headerRoomId?: string }) {
     const { routedRoomId, urlRoomId, headerRoomId } = keys;
@@ -172,7 +217,7 @@ export class RoomDurableObject {
       return byteLen <= this.cfg.readLimitBytes;
     };
 
-    const send = (sock: WebSocket, obj: Json) => {
+    const send = (sock: WebSocket, obj: JsonObject) => {
       try {
         sock.send(jsonStringify(obj));
       } catch {
@@ -205,6 +250,12 @@ export class RoomDurableObject {
       const clientId = (msg.clientId && String(msg.clientId)) || connectionId;
       const standalone = !!msg.standalone;
 
+      const rejectAndClose = (reason: string, detail?: string) => {
+        send(ws, { type: "reject", reason });
+        clearPreRegPing();
+        protocolErrorClose(detail ?? reason);
+      };
+
       // Optional auth webhook
       let iceServers: Json | undefined;
       let authzMetadata: Json | undefined;
@@ -224,39 +275,51 @@ export class RoomDurableObject {
         const headers = new Headers({ "Content-Type": "application/json" });
         // Forward select headers from original upgrade request
         for (const name of this.cfg.copyHeaderNames) {
-          // Avoid forbidden headers; Workers runtime strips/guards some automatically
           const value = request.headers.get(name);
           if (value) headers.set(name, value);
         }
 
-        let authOk = false;
+        const timeoutMs = Math.max(this.cfg.pongTimeoutSec * 1000, 5000);
+        let authResponse: Response;
         try {
-          const controller = AbortSignal.timeout(Math.max(this.cfg.pongTimeoutSec * 1000, 5000)); // reuse timeout knobs; min 5s
-          const res = await fetch(this.cfg.authnWebhookUrl, {
+          authResponse = await fetch(this.cfg.authnWebhookUrl, {
             method: "POST",
             headers,
             body: JSON.stringify(payload),
-            signal: controller,
+            signal: AbortSignal.timeout(timeoutMs),
           });
-          if (res.ok) {
-            const body = (await res.json()) as Partial<AuthnResponse>;
-            if (typeof body.allowed === "boolean" && body.allowed) {
-              authOk = true;
-              iceServers = body.iceServers;
-              authzMetadata = body.authzMetadata;
-            } else {
-              const reason = (body && "reason" in body && (body as any).reason) || "denied";
-              send(ws, { type: "reject", reason });
-            }
-          }
         } catch {
-          // ignore; will be handled as auth failure below
+          rejectAndClose("InternalServerError", "auth webhook error");
+          return;
         }
-        if (!authOk) {
-          if (!ws) return; // already closed
-          send(ws, { type: "reject", reason: "InternalServerError" });
-          return protocolErrorClose("auth failed");
+
+        if (!authResponse.ok) {
+          rejectAndClose("InternalServerError", "auth webhook non-200");
+          return;
         }
+
+        let authBody: unknown;
+        try {
+          authBody = await authResponse.json();
+        } catch {
+          rejectAndClose("InternalServerError", "auth webhook invalid JSON");
+          return;
+        }
+
+        if (!isObject(authBody) || typeof (authBody as Partial<AuthnResponse>).allowed !== "boolean") {
+          rejectAndClose("InternalServerError", "auth webhook malformed response");
+          return;
+        }
+
+        const body = authBody as AuthnResponse;
+        if (!body.allowed) {
+          const reason = typeof body.reason === "string" && body.reason.trim().length > 0 ? body.reason : "denied";
+          rejectAndClose(reason, "auth webhook denied");
+          return;
+        }
+
+        iceServers = body.iceServers;
+        authzMetadata = body.authzMetadata;
       }
 
       // Create participant
@@ -299,7 +362,7 @@ export class RoomDurableObject {
         isExistUser: isExistClient,
         authzMetadata,
         iceServers,
-      } as Json);
+      } satisfies JsonObject);
 
       // Start timers for this participant
       this.startTimers(participant);
@@ -379,6 +442,39 @@ export class RoomDurableObject {
       clearPreRegPing();
       this.teardown(participant, "error");
     });
+  }
+
+  private startTimers(p: Participant) {
+    // Read deadline watchdog
+    const readTick = () => {
+      const idleMs = nowMs() - p.lastReadAt;
+      if (idleMs > this.cfg.readTimeoutSec * 1000) {
+        try {
+          p.socket.close(1000, "read timeout");
+        } catch { /* ignore */ }
+        this.teardown(p, "read-timeout");
+      }
+    };
+    p.readDeadline = setInterval(readTick, Math.max(1000, Math.floor(this.cfg.readTimeoutSec * 250))) as any;
+
+    // Heartbeats disabled in standalone
+    if (!p.standalone) {
+      p.pingInterval = setInterval(() => {
+        try {
+          p.socket.send(jsonStringify({ type: "ping" }));
+          // set pong watchdog
+          p.pongDeadline = setTimeout(() => {
+            try {
+              p.socket.close(1000, "pong timeout");
+            } catch { /* ignore */ }
+            this.teardown(p, "pong-timeout");
+          }, this.cfg.pongTimeoutSec * 1000) as any;
+        } catch {
+          this.teardown(p, "ping-send-failed");
+        }
+      }, this.cfg.pingIntervalSec * 1000) as any;
+    }
+  }
 
   private forwardToPeer(sender: Participant, payloadText: string) {
     const peer = this.getPeer(sender);
@@ -461,3 +557,142 @@ export class RoomDurableObject {
     if (peer && this.a && peer.connectionId === this.a.connectionId) this.a = null;
     if (peer && this.b && peer.connectionId === this.b.connectionId) this.b = null;
   }
+
+  private getPeer(p: Participant): Participant | null {
+    if (this.a && p.connectionId === this.a.connectionId) return this.b;
+    if (this.b && p.connectionId === this.b.connectionId) return this.a;
+    return null;
+  }
+}
+
+// Backward compatibility: keep old class name pointing to the same implementation
+export class SignallingRoom extends RoomDurableObject {}
+
+type ParsedConfig = {
+  authnWebhookUrl?: string;
+  disconnectWebhookUrl?: string;
+  copyHeaderNames: string[];
+  typeMessage: boolean;
+  pingIntervalSec: number;
+  pongTimeoutSec: number;
+  readTimeoutSec: number;
+  readLimitBytes: number;
+};
+
+function parseConfig(env: Env): ParsedConfig {
+  const authnWebhookUrl = toOptionalString(env.AUTHN_WEBHOOK_URL);
+  const disconnectWebhookUrl = toOptionalString(env.DISCONNECT_WEBHOOK_URL);
+  const copyHeaderNames = parseHeaderNames(env.COPY_WEBSOCKET_HEADER_NAMES);
+  const typeMessage = parseBoolean(env.TYPE_MESSAGE, false);
+  const pingIntervalSec = parseNumber(env.WS_PING_INTERVAL_SEC, 5, { min: 1 });
+  const pongTimeoutSec = parseNumber(env.WS_PONG_TIMEOUT_SEC, 60, { min: 1 });
+  const readTimeoutSec = parseNumber(env.WS_READ_TIMEOUT_SEC, 90, { min: 1 });
+  const readLimitBytes = parseNumber(env.READ_LIMIT_BYTES, 1_048_576, { min: 1 });
+
+  return Object.freeze({
+    authnWebhookUrl,
+    disconnectWebhookUrl,
+    copyHeaderNames,
+    typeMessage,
+    pingIntervalSec,
+    pongTimeoutSec,
+    readTimeoutSec,
+    readLimitBytes,
+  });
+}
+
+function toOptionalString(value?: string): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function parseBoolean(value: string | undefined, defaultValue: boolean): boolean {
+  if (value === undefined) return defaultValue;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "") return defaultValue;
+  if (["1", "true", "t", "yes", "y", "on"].includes(normalized)) return true;
+  if (["0", "false", "f", "no", "n", "off"].includes(normalized)) return false;
+  return defaultValue;
+}
+
+function parseNumber(
+  value: string | undefined,
+  defaultValue: number,
+  opts: { min?: number; max?: number } = {}
+): number {
+  if (value === undefined) return defaultValue;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return defaultValue;
+  let result = parsed;
+  if (opts.min !== undefined && result < opts.min) result = opts.min;
+  if (opts.max !== undefined && result > opts.max) result = opts.max;
+  return result;
+}
+
+function parseHeaderNames(value: string | undefined): string[] {
+  if (!value) return [];
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const raw of value.split(",")) {
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    const canonical = trimmed.toLowerCase();
+    if (seen.has(canonical)) continue;
+    seen.add(canonical);
+    result.push(canonical);
+  }
+  return result;
+}
+
+function jsonStringify(value: Json | JsonObject): string {
+  const serialized = JSON.stringify(value);
+  return serialized ?? "null";
+}
+
+function safeParseJson(text: string): Json | undefined {
+  try {
+    return JSON.parse(text) as Json;
+  } catch {
+    return undefined;
+  }
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function nowMs(): number {
+  return Date.now();
+}
+
+const ULID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+const ULID_TIME_LEN = 10;
+const ULID_RANDOM_LEN = 16;
+const ULID_TIME_MAX = 2 ** 48;
+
+function ulid(): string {
+  const timeComponent = encodeTime(nowMs());
+  const randomComponent = encodeRandom();
+  return timeComponent + randomComponent;
+}
+
+function encodeTime(time: number): string {
+  let value = Math.floor(time % ULID_TIME_MAX);
+  const chars = new Array<string>(ULID_TIME_LEN).fill("0");
+  for (let i = ULID_TIME_LEN - 1; i >= 0; i--) {
+    chars[i] = ULID_ALPHABET[value % 32];
+    value = Math.floor(value / 32);
+  }
+  return chars.join("");
+}
+
+function encodeRandom(): string {
+  const buffer = new Uint8Array(ULID_RANDOM_LEN);
+  crypto.getRandomValues(buffer);
+  let output = "";
+  for (let i = 0; i < buffer.length; i++) {
+    output += ULID_ALPHABET[buffer[i] & 31];
+  }
+  return output;
+}
