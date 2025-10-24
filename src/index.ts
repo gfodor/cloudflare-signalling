@@ -120,11 +120,6 @@ type TurnAllocation = {
   ttlSeconds?: number;
 };
 
-type TurnCredentialsSummary = {
-  expiresAt?: string;
-  ttlSeconds?: number;
-};
-
 type Participant = {
   socket: WebSocket;
   request: Request;
@@ -140,7 +135,6 @@ type Participant = {
   urlRoomId?: string;
   headerRoomId?: string;
   turnRequested: boolean;
-  turnCredentials?: TurnCredentialsSummary;
   // webhook cache
   iceServers?: Json;
   authzMetadata?: Json;
@@ -378,7 +372,6 @@ export class RoomDurableObject {
       }
 
       const mergedIceServers = mergeIceServers(iceServers, turnAllocation?.iceServers);
-      const turnSummary = summarizeTurn(turnAllocation);
 
       // Create participant
       participant = {
@@ -392,7 +385,6 @@ export class RoomDurableObject {
         urlRoomId,
         headerRoomId,
         turnRequested,
-        turnCredentials: turnSummary,
         iceServers: mergedIceServers,
         authzMetadata,
       };
@@ -423,11 +415,6 @@ export class RoomDurableObject {
         authzMetadata,
         iceServers: mergedIceServers,
       };
-
-      const turnSummaryJson = turnSummaryToJson(turnSummary);
-      if (turnSummaryJson) {
-        acceptPayload.turnCredentials = turnSummaryJson;
-      }
 
       send(ws, acceptPayload);
 
@@ -893,26 +880,6 @@ function mergeIceServers(primary?: Json, secondary?: Json): Json | undefined {
   }
 
   return undefined;
-}
-
-function summarizeTurn(allocation: TurnAllocation | undefined): TurnCredentialsSummary | undefined {
-  if (!allocation) return undefined;
-  const summary: TurnCredentialsSummary = {};
-  if (typeof allocation.expiresAt === "string" && allocation.expiresAt.trim().length > 0) {
-    summary.expiresAt = allocation.expiresAt;
-  }
-  if (typeof allocation.ttlSeconds === "number" && Number.isFinite(allocation.ttlSeconds) && allocation.ttlSeconds > 0) {
-    summary.ttlSeconds = Math.floor(allocation.ttlSeconds);
-  }
-  return Object.keys(summary).length > 0 ? summary : undefined;
-}
-
-function turnSummaryToJson(summary: TurnCredentialsSummary | undefined): Json | undefined {
-  if (!summary) return undefined;
-  const payload: Record<string, Json> = {};
-  if (summary.expiresAt) payload.expiresAt = summary.expiresAt;
-  if (summary.ttlSeconds !== undefined) payload.ttlSeconds = summary.ttlSeconds;
-  return Object.keys(payload).length > 0 ? payload : undefined;
 }
 
 function sanitizeIceServers(raw: unknown, filterPort53: boolean): Json | undefined {

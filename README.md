@@ -106,11 +106,7 @@ Successful registration yields:
   "authzMetadata": {"role": "guest"},
   "iceServers": [
     {"urls": ["stun:stun.example.net"], "username": "optional", "credential": "optional"}
-  ],
-  "turnCredentials": {
-    "expiresAt": "2025-10-24T12:34:56Z",
-    "ttlSeconds": 600
-  }
+  ]
 }
 ```
 
@@ -118,7 +114,7 @@ On failure the client receives `{ "type": "reject", "reason": "<string>" }` befo
 
 #### Requesting Cloudflare TURN credentials
 
-Clients that append `?turn=true` to the `/signaling` WebSocket URL (for example `wss://signalling.portalvr.io/signaling?roomId=alpha&turn=true`) and workers configured with `TURN_KEY_ID` and `TURN_API_TOKEN` will trigger an on-demand call to Cloudflare's TURN REST API. The response's `iceServers` entries are merged into the `accept` payload and the optional `turnCredentials` object surfaces expiration metadata. If TURN is not configured or the API call fails, registration still succeeds without TURN data.
+Clients that append `?turn=true` to the `/signaling` WebSocket URL (for example `wss://signalling.portalvr.io/signaling?roomId=alpha&turn=true`) and workers configured with `TURN_KEY_ID` and `TURN_API_TOKEN` will trigger an on-demand call to Cloudflare's TURN REST API. The response's `iceServers` entries—containing both STUN and TURN URLs plus the short-lived username/credential—are merged into the `accept` payload. If TURN is not configured or the API call fails, registration still succeeds without TURN data.
 
 ### Post-registration Messaging
 

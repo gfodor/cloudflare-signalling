@@ -316,10 +316,9 @@ describe("Cloudflare signalling worker", () => {
     });
     expect(hasPort53).toBe(false);
 
-    expect(accept.turnCredentials).toEqual({
-      expiresAt: "2025-10-24T12:34:56Z",
-      ttlSeconds: 120,
-    });
+    const relay = servers[0];
+    expect(relay.username).toBe("user-123");
+    expect(relay.credential).toBe("cred-456");
 
     ws.close();
   });
