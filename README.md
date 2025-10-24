@@ -47,6 +47,12 @@ All runtime knobs are provided through Worker environment variables. Defaults mi
 | `WS_PONG_TIMEOUT_SEC` | number | `60` | Timeout (seconds) to await `{ "type": "pong" }` after a ping before closing the connection.
 | `WS_READ_TIMEOUT_SEC` | number | `90` | Maximum idle time (seconds) without receiving any frame before closing the socket.
 | `READ_LIMIT_BYTES` | number | `1048576` | Maximum size in bytes for any inbound WebSocket message.
+| `TURN_KEY_ID` | string | unset | Cloudflare TURN key identifier. When set along with `TURN_API_TOKEN`, TURN credentials are minted for clients that request them.
+| `TURN_API_TOKEN` | string | unset | Bearer token with Cloudflare Calls TURN scope used to call the credential generation API.
+| `TURN_CREDENTIAL_TTL_SEC` | number | `600` | TTL (seconds) requested for generated TURN credentials.
+| `TURN_REQUEST_TIMEOUT_MS` | number | `5000` | Timeout (milliseconds) for TURN credential HTTP requests.
+| `TURN_API_BASE_URL` | string | `https://rtc.live.cloudflare.com` | Base URL for the Cloudflare TURN API (useful for testing/mocking).
+| `TURN_FILTER_PORT_53` | boolean | `false` | When true, URLs that end with port `53` are removed from the TURN server list.
 
 Durable Object binding (wrangler snippet):
 
@@ -100,11 +106,19 @@ Successful registration yields:
   "authzMetadata": {"role": "guest"},
   "iceServers": [
     {"urls": ["stun:stun.example.net"], "username": "optional", "credential": "optional"}
-  ]
+  ],
+  "turnCredentials": {
+    "expiresAt": "2025-10-24T12:34:56Z",
+    "ttlSeconds": 600
+  }
 }
 ```
 
 On failure the client receives `{ "type": "reject", "reason": "<string>" }` before the socket closes.
+
+#### Requesting Cloudflare TURN credentials
+
+Clients that append `?turn=true` to the `/signaling` WebSocket URL (for example `wss://signalling.portalvr.io/signaling?roomId=alpha&turn=true`) and workers configured with `TURN_KEY_ID` and `TURN_API_TOKEN` will trigger an on-demand call to Cloudflare's TURN REST API. The response's `iceServers` entries are merged into the `accept` payload and the optional `turnCredentials` object surfaces expiration metadata. If TURN is not configured or the API call fails, registration still succeeds without TURN data.
 
 ### Post-registration Messaging
 

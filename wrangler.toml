@@ -12,8 +12,8 @@ bindings = [
 
 [[migrations]]
 tag = "v1"
-new_classes = ["SignallingRoom"]
+new_sqlite_classes = ["SignallingRoom"]
 
 [[migrations]]
 tag = "v2"
-new_classes = ["RoomDurableObject"]
+new_sqlite_classes = ["RoomDurableObject"]

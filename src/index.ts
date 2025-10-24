@@ -9,6 +9,12 @@ export interface Env {
   WS_PONG_TIMEOUT_SEC?: string;
   WS_READ_TIMEOUT_SEC?: string;
   READ_LIMIT_BYTES?: string;
+  TURN_KEY_ID?: string;
+  TURN_API_TOKEN?: string;
+  TURN_CREDENTIAL_TTL_SEC?: string;
+  TURN_REQUEST_TIMEOUT_MS?: string;
+  TURN_API_BASE_URL?: string;
+  TURN_FILTER_PORT_53?: string;
 }
 
 export default {
@@ -99,6 +105,26 @@ type TeardownOptions = {
   notifyPeer?: boolean;
 };
 
+type TurnConfig = {
+  keyId: string;
+  apiToken: string;
+  ttlSec: number;
+  requestTimeoutMs: number;
+  apiBaseUrl: string;
+  filterPort53: boolean;
+};
+
+type TurnAllocation = {
+  iceServers?: Json;
+  expiresAt?: string;
+  ttlSeconds?: number;
+};
+
+type TurnCredentialsSummary = {
+  expiresAt?: string;
+  ttlSeconds?: number;
+};
+
 type Participant = {
   socket: WebSocket;
   request: Request;
@@ -113,6 +139,8 @@ type Participant = {
   routedRoomId: string; // key used to select this DO
   urlRoomId?: string;
   headerRoomId?: string;
+  turnRequested: boolean;
+  turnCredentials?: TurnCredentialsSummary;
   // webhook cache
   iceServers?: Json;
   authzMetadata?: Json;
@@ -163,6 +191,7 @@ export class RoomDurableObject {
     const urlRoomId = url.searchParams.get("roomId") ?? undefined;
     const headerRoomId = request.headers.get("CF-Room-Id") ?? undefined;
     const routedRoomId = urlRoomId ?? headerRoomId ?? "∅";
+    const turnRequested = parseQueryBoolean(url.searchParams.get("turn"));
 
     const pair = new WebSocketPair();
     const client = pair[0];
@@ -173,13 +202,18 @@ export class RoomDurableObject {
       routedRoomId,
       urlRoomId,
       headerRoomId,
+      turnRequested,
     });
 
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  private attach(ws: WebSocket, request: Request, keys: { routedRoomId: string; urlRoomId?: string; headerRoomId?: string }) {
-    const { routedRoomId, urlRoomId, headerRoomId } = keys;
+  private attach(
+    ws: WebSocket,
+    request: Request,
+    keys: { routedRoomId: string; urlRoomId?: string; headerRoomId?: string; turnRequested: boolean }
+  ) {
+    const { routedRoomId, urlRoomId, headerRoomId, turnRequested } = keys;
 
     ws.accept();
     // Enforce text-only; Cloudflare Worker WS is text/binary; we will reject binary later.
@@ -327,6 +361,25 @@ export class RoomDurableObject {
         authzMetadata = body.authzMetadata;
       }
 
+      let turnAllocation: TurnAllocation | undefined;
+      if (turnRequested) {
+        if (this.cfg.turn) {
+          turnAllocation = await this.generateTurnCredentials({
+            roomId: msg.roomId,
+            clientId,
+            connectionId,
+          });
+        } else {
+          console.warn("TURN requested but TURN_KEY_ID/TURN_API_TOKEN are not configured", {
+            roomId: msg.roomId,
+            clientId,
+          });
+        }
+      }
+
+      const mergedIceServers = mergeIceServers(iceServers, turnAllocation?.iceServers);
+      const turnSummary = summarizeTurn(turnAllocation);
+
       // Create participant
       participant = {
         socket: ws,
@@ -338,7 +391,9 @@ export class RoomDurableObject {
         routedRoomId,
         urlRoomId,
         headerRoomId,
-        iceServers,
+        turnRequested,
+        turnCredentials: turnSummary,
+        iceServers: mergedIceServers,
         authzMetadata,
       };
       registered = true;
@@ -360,14 +415,21 @@ export class RoomDurableObject {
       clearPreRegPing();
 
       // Send accept
-      send(ws, {
+      const acceptPayload: JsonObject = {
         type: "accept",
         connectionId,
         isExistClient,
         isExistUser: isExistClient,
         authzMetadata,
-        iceServers,
-      } satisfies JsonObject);
+        iceServers: mergedIceServers,
+      };
+
+      const turnSummaryJson = turnSummaryToJson(turnSummary);
+      if (turnSummaryJson) {
+        acceptPayload.turnCredentials = turnSummaryJson;
+      }
+
+      send(ws, acceptPayload);
 
       // Start timers for this participant
       this.startTimers(participant);
@@ -486,6 +548,108 @@ export class RoomDurableObject {
         }
       }, this.cfg.pingIntervalSec * 1000) as any;
     }
+  }
+
+  private async generateTurnCredentials(context: {
+    roomId: string;
+    clientId: string;
+    connectionId: string;
+  }): Promise<TurnAllocation | undefined> {
+    const turnCfg = this.cfg.turn;
+    if (!turnCfg) return undefined;
+
+    let endpoint: URL;
+    try {
+      endpoint = new URL(
+        `/v1/turn/keys/${encodeURIComponent(turnCfg.keyId)}/credentials/generate-ice-servers`,
+        turnCfg.apiBaseUrl
+      );
+    } catch (error) {
+      console.error("Failed to construct TURN endpoint URL", {
+        roomId: context.roomId,
+        clientId: context.clientId,
+        error,
+      });
+      return undefined;
+    }
+
+    const payload = JSON.stringify({ ttl: turnCfg.ttlSec });
+    let response: Response;
+    try {
+      response = await fetch(endpoint.toString(), {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${turnCfg.apiToken}`,
+          "Content-Type": "application/json",
+        },
+        body: payload,
+        signal: AbortSignal.timeout(turnCfg.requestTimeoutMs),
+      });
+    } catch (error) {
+      console.error("TURN credential request failed", {
+        roomId: context.roomId,
+        clientId: context.clientId,
+        error,
+      });
+      return undefined;
+    }
+
+    if (!response.ok) {
+      let responseText = "";
+      try {
+        responseText = await response.text();
+      } catch {
+        // ignore
+      }
+      console.error("TURN credential request returned non-OK", {
+        status: response.status,
+        roomId: context.roomId,
+        clientId: context.clientId,
+        body: responseText.slice(0, 512),
+      });
+      return undefined;
+    }
+
+    let body: unknown;
+    try {
+      body = await response.json();
+    } catch (error) {
+      console.error("TURN credential response was not valid JSON", {
+        roomId: context.roomId,
+        clientId: context.clientId,
+        error,
+      });
+      return undefined;
+    }
+
+    if (!isObject(body)) {
+      console.error("TURN credential response was not an object", {
+        roomId: context.roomId,
+        clientId: context.clientId,
+      });
+      return undefined;
+    }
+
+    const record = body as Record<string, unknown>;
+    const allocation: TurnAllocation = {};
+
+    const sanitizedIceServers = sanitizeIceServers(record.iceServers, turnCfg.filterPort53);
+    if (sanitizedIceServers) {
+      allocation.iceServers = sanitizedIceServers;
+    }
+
+    const expiresAtRaw = record.expiresAt ?? record.expires;
+    if (typeof expiresAtRaw === "string" && expiresAtRaw.trim().length > 0) {
+      allocation.expiresAt = expiresAtRaw;
+    }
+
+    const ttlCandidate = record.ttl ?? record.ttlSeconds ?? record.expiresIn;
+    const ttlSeconds = Number(ttlCandidate);
+    if (Number.isFinite(ttlSeconds) && ttlSeconds > 0) {
+      allocation.ttlSeconds = Math.floor(ttlSeconds);
+    }
+
+    return allocation;
   }
 
   private forwardToPeer(sender: Participant, payloadText: string) {
@@ -607,6 +771,7 @@ type ParsedConfig = {
   pongTimeoutSec: number;
   readTimeoutSec: number;
   readLimitBytes: number;
+  turn?: TurnConfig;
 };
 
 function parseConfig(env: Env): ParsedConfig {
@@ -619,6 +784,23 @@ function parseConfig(env: Env): ParsedConfig {
   const readTimeoutSec = parseNumber(env.WS_READ_TIMEOUT_SEC, 90, { min: 1 });
   const readLimitBytes = parseNumber(env.READ_LIMIT_BYTES, 1_048_576, { min: 1 });
 
+  const turnKeyId = toOptionalString(env.TURN_KEY_ID);
+  const turnApiToken = toOptionalString(env.TURN_API_TOKEN);
+  const turn: TurnConfig | undefined =
+    turnKeyId && turnApiToken
+      ? {
+          keyId: turnKeyId,
+          apiToken: turnApiToken,
+          ttlSec: Math.max(1, Math.round(parseNumber(env.TURN_CREDENTIAL_TTL_SEC, 600, { min: 60, max: 86_400 }))),
+          requestTimeoutMs: Math.max(
+            100,
+            Math.round(parseNumber(env.TURN_REQUEST_TIMEOUT_MS, 5000, { min: 1000, max: 60_000 }))
+          ),
+          apiBaseUrl: sanitizeBaseUrl(toOptionalString(env.TURN_API_BASE_URL)) ?? "https://rtc.live.cloudflare.com",
+          filterPort53: parseBoolean(env.TURN_FILTER_PORT_53, false),
+        }
+      : undefined;
+
   return Object.freeze({
     authnWebhookUrl,
     disconnectWebhookUrl,
@@ -628,6 +810,7 @@ function parseConfig(env: Env): ParsedConfig {
     pongTimeoutSec,
     readTimeoutSec,
     readLimitBytes,
+    turn,
   });
 }
 
@@ -673,6 +856,131 @@ function parseHeaderNames(value: string | undefined): string[] {
     result.push(canonical);
   }
   return result;
+}
+
+function parseQueryBoolean(value: string | null): boolean {
+  if (value == null) return false;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "") return false;
+  if (["0", "false", "f", "no", "n", "off"].includes(normalized)) return false;
+  return true;
+}
+
+function mergeIceServers(primary?: Json, secondary?: Json): Json | undefined {
+  const primaryIsArray = Array.isArray(primary);
+  const secondaryIsArray = Array.isArray(secondary);
+
+  if (primaryIsArray && secondaryIsArray) {
+    const first = cloneJsonValue(primary as Json) as Json[];
+    const second = cloneJsonValue(secondary as Json) as Json[];
+    return [...first, ...second] as Json;
+  }
+
+  if (primaryIsArray) {
+    return cloneJsonValue(primary as Json);
+  }
+
+  if (secondaryIsArray) {
+    return cloneJsonValue(secondary as Json);
+  }
+
+  if (primary !== undefined) {
+    return cloneJsonValue(primary);
+  }
+
+  if (secondary !== undefined) {
+    return cloneJsonValue(secondary);
+  }
+
+  return undefined;
+}
+
+function summarizeTurn(allocation: TurnAllocation | undefined): TurnCredentialsSummary | undefined {
+  if (!allocation) return undefined;
+  const summary: TurnCredentialsSummary = {};
+  if (typeof allocation.expiresAt === "string" && allocation.expiresAt.trim().length > 0) {
+    summary.expiresAt = allocation.expiresAt;
+  }
+  if (typeof allocation.ttlSeconds === "number" && Number.isFinite(allocation.ttlSeconds) && allocation.ttlSeconds > 0) {
+    summary.ttlSeconds = Math.floor(allocation.ttlSeconds);
+  }
+  return Object.keys(summary).length > 0 ? summary : undefined;
+}
+
+function turnSummaryToJson(summary: TurnCredentialsSummary | undefined): Json | undefined {
+  if (!summary) return undefined;
+  const payload: Record<string, Json> = {};
+  if (summary.expiresAt) payload.expiresAt = summary.expiresAt;
+  if (summary.ttlSeconds !== undefined) payload.ttlSeconds = summary.ttlSeconds;
+  return Object.keys(payload).length > 0 ? payload : undefined;
+}
+
+function sanitizeIceServers(raw: unknown, filterPort53: boolean): Json | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const cloned = cloneJsonValue(raw as Json) as unknown[];
+  if (!Array.isArray(cloned)) return undefined;
+  if (!filterPort53) {
+    return cloned as Json;
+  }
+
+  const allow = (url: unknown) => typeof url === "string" && !isPort53(url);
+
+  const filtered: Json[] = [];
+  for (const entry of cloned) {
+    if (!isObject(entry)) continue;
+    const copy: Record<string, unknown> = { ...entry };
+
+    if (Array.isArray(copy.urls)) {
+      copy.urls = copy.urls.filter(allow);
+      if ((copy.urls as unknown[]).length === 0) delete copy.urls;
+    } else if (typeof copy.urls === "string") {
+      if (!allow(copy.urls)) delete copy.urls;
+    }
+
+    if (typeof copy.url === "string") {
+      if (allow(copy.url)) {
+        // keep as-is
+      } else {
+        delete copy.url;
+      }
+    }
+
+    if (!("urls" in copy) && !("url" in copy)) {
+      continue;
+    }
+
+    filtered.push(copy as Json);
+  }
+
+  return filtered.length > 0 ? (filtered as Json) : undefined;
+}
+
+function isPort53(url: string): boolean {
+  const questionIndex = url.indexOf("?");
+  const withoutQuery = questionIndex === -1 ? url : url.slice(0, questionIndex);
+  const colonIndex = withoutQuery.lastIndexOf(":");
+  if (colonIndex === -1) return false;
+  const portPart = withoutQuery.slice(colonIndex + 1);
+  if (!/^\d+$/.test(portPart)) return false;
+  return Number(portPart) === 53;
+}
+
+function sanitizeBaseUrl(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  try {
+    const url = new URL(trimmed);
+    let normalized = url.toString();
+    normalized = normalized.replace(/\/+$/, "");
+    return normalized.length > 0 ? normalized : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function cloneJsonValue<T extends Json>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
 }
 
 function jsonStringify(value: Json | JsonObject): string {

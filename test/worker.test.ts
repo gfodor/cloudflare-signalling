@@ -227,7 +227,100 @@ describe("Cloudflare signalling worker", () => {
     const accept = parseJsonMessage(await waitForMessage(ws));
     expect(accept.type).toBe("accept");
     expect(accept.authzMetadata).toEqual({ role: "vip" });
-    expect(accept.iceServers).toEqual([{ urls: ["stun:example.org"] }]);
+   expect(accept.iceServers).toEqual([{ urls: ["stun:example.org"] }]);
+    ws.close();
+  });
+
+  test("TURN credentials delivered when turn=true", async () => {
+    let captured: { path?: string; authorization?: string; body?: any } | null = null;
+    const server = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk) => chunks.push(chunk));
+      req.on("end", () => {
+        const text = Buffer.concat(chunks).toString("utf8");
+        let parsed: unknown = undefined;
+        try {
+          parsed = text ? JSON.parse(text) : undefined;
+        } catch {
+          parsed = undefined;
+        }
+        captured = {
+          path: req.url ?? undefined,
+          authorization: req.headers["authorization"],
+          body: parsed,
+        };
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            iceServers: [
+              {
+                urls: [
+                  "stun:global.turn.cloudflare.com:3478",
+                  "turn:global.turn.cloudflare.com:53?transport=udp",
+                  "turns:global.turn.cloudflare.com:5349?transport=tcp",
+                ],
+                username: "user-123",
+                credential: "cred-456",
+              },
+            ],
+            ttl: 120,
+            expiresAt: "2025-10-24T12:34:56Z",
+          })
+        );
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    const { port } = server.address() as http.AddressInfo;
+
+    const mf = await createWorker({
+      bindings: {
+        TURN_KEY_ID: "test-turn-key",
+        TURN_API_TOKEN: "super-secret-token",
+        TURN_CREDENTIAL_TTL_SEC: "120",
+        TURN_FILTER_PORT_53: "true",
+        TURN_API_BASE_URL: `http://127.0.0.1:${port}`,
+      },
+    });
+    disposables.push(() => mf.dispose());
+    disposables.push(
+      () =>
+        new Promise<void>((resolve) => {
+          server.close(() => resolve());
+        })
+    );
+
+    const ws = await connectClient(mf, "turn-room", { path: "/signaling?roomId=turn-room&turn=true" });
+    ws.send(jsonMessage({ type: "register", roomId: "turn-room" }));
+    const accept = parseJsonMessage(await waitForMessage(ws));
+
+    expect(accept.type).toBe("accept");
+    expect(captured).not.toBeNull();
+    expect(captured?.authorization).toBe("Bearer super-secret-token");
+    expect(captured?.path).toBe("/v1/turn/keys/test-turn-key/credentials/generate-ice-servers");
+    expect(captured?.body?.ttl).toBe(120);
+
+    expect(Array.isArray(accept.iceServers)).toBe(true);
+    const servers = accept.iceServers as Array<Record<string, unknown>>;
+    expect(servers).toHaveLength(1);
+    const urls = servers[0]?.urls as string[];
+    expect(Array.isArray(urls)).toBe(true);
+    expect(urls).toContain("stun:global.turn.cloudflare.com:3478");
+    expect(urls).toContain("turns:global.turn.cloudflare.com:5349?transport=tcp");
+    const hasPort53 = urls.some((url) => {
+      const qIndex = url.indexOf("?");
+      const withoutQuery = qIndex === -1 ? url : url.slice(0, qIndex);
+      const colonIndex = withoutQuery.lastIndexOf(":");
+      if (colonIndex === -1) return false;
+      const portPart = withoutQuery.slice(colonIndex + 1);
+      return /^\d+$/.test(portPart) && Number(portPart) === 53;
+    });
+    expect(hasPort53).toBe(false);
+
+    expect(accept.turnCredentials).toEqual({
+      expiresAt: "2025-10-24T12:34:56Z",
+      ttlSeconds: 120,
+    });
+
     ws.close();
   });
 });
